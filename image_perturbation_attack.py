@@ -459,6 +459,11 @@ def run_experiment(image_path, output_dir="results"):
 
 def create_demo_image(save_path="demo_image.png"):
     """데모용 간단한 이미지 생성"""
+    # 저장 디렉토리 생성
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    
     # 간단한 풍경 이미지 생성
     img = Image.new('RGB', (512, 512), color=(135, 206, 235))  # 하늘색 배경
     
