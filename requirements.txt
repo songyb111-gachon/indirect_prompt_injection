@@ -1,0 +1,22 @@
+# Indirect Prompt Injection (From Image) 실습
+# Vision-Language Model dependencies
+
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.36.0
+accelerate>=0.25.0
+bitsandbytes>=0.41.0
+Pillow>=10.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+tqdm>=4.65.0
+
+# For LLaVA model
+sentencepiece>=0.1.99
+
+# Image processing
+opencv-python>=4.8.0
+
+# Optional: for gradient-based perturbation
+scipy>=1.11.0
+
