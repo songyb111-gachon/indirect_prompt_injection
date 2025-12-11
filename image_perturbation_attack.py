@@ -85,19 +85,26 @@ class Config:
 # ============================================================
 
 def load_model(model_id=Config.MODEL_ID, use_4bit=False, for_attack=False):
-    """Vision-Language 모델 로드
+    """Vision-Language 모델 로드 (Multi-GPU 지원)
     
     Args:
         for_attack: True면 gradient 계산을 위해 양자화 없이 로드
     """
     print(f"[*] 모델 로드 중: {model_id}")
     
+    # GPU 개수 확인
+    num_gpus = torch.cuda.device_count()
+    print(f"[*] 사용 가능한 GPU 수: {num_gpus}")
+    
+    if num_gpus > 1:
+        print(f"[*] Multi-GPU 모드: {num_gpus}개 GPU 사용")
+    
     if for_attack:
         # Perturbation 공격용: gradient 계산을 위해 float16으로 로드 (양자화 X)
         print("[*] Perturbation 공격 모드: gradient 계산을 위해 양자화 없이 로드")
         model = LlavaForConditionalGeneration.from_pretrained(
             model_id,
-            device_map="auto",
+            device_map="auto",  # 자동으로 여러 GPU에 분산
             torch_dtype=torch.float16
         )
     elif use_4bit and Config.DEVICE == "cuda":
@@ -123,7 +130,11 @@ def load_model(model_id=Config.MODEL_ID, use_4bit=False, for_attack=False):
     
     processor = AutoProcessor.from_pretrained(model_id)
     
-    print(f"[✓] 모델 로드 완료! 디바이스: {Config.DEVICE}")
+    # 모델이 어느 GPU에 로드되었는지 출력
+    if hasattr(model, 'hf_device_map'):
+        print(f"[*] 모델 분산 정보: {model.hf_device_map}")
+    
+    print(f"[✓] 모델 로드 완료! 디바이스: {Config.DEVICE}, GPU 수: {num_gpus}")
     return model, processor
 
 # ============================================================
@@ -307,14 +318,16 @@ def create_adversarial_image(
             losses.append(loss.item())
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
             
-            # 메모리 정리
-            del outputs, logits
-            if i % 20 == 0:
-                torch.cuda.empty_cache()
+            # 메모리 정리 (매 iteration마다)
+            del outputs, logits, loss
+            torch.cuda.empty_cache()
             
         except torch.cuda.OutOfMemoryError as e:
-            print(f"\n[!] CUDA OOM at iteration {i}: {e}")
+            if i < 5:  # 처음 몇 번만 에러 출력
+                print(f"\n[!] CUDA OOM at iteration {i}")
             torch.cuda.empty_cache()
+            import gc
+            gc.collect()
             losses.append(losses[-1] if losses else 10.0)
             continue
         except Exception as e:
@@ -499,7 +512,7 @@ def plot_loss_curve(losses, save_path=None):
 # 메인 실험
 # ============================================================
 
-def run_experiment(image_path, output_dir="results"):
+def run_experiment(image_path, output_dir="results", num_iterations=200):
     """전체 실험 실행"""
     
     # 출력 디렉토리 생성
@@ -567,7 +580,7 @@ def run_experiment(image_path, output_dir="results"):
             model, processor, original_image,
             hidden_prompt=hidden_prompt,
             normal_prompt=normal_prompt,
-            num_iterations=200,  # 충분한 iteration
+            num_iterations=num_iterations,
             lr=0.005,
             epsilon=16/255  # L∞ bound
         )
@@ -738,8 +751,18 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default="results", help="출력 디렉토리")
     parser.add_argument("--hidden-prompt", type=str, default=Config.HIDDEN_PROMPT, help="주입할 숨겨진 프롬프트")
     parser.add_argument("--demo", action="store_true", help="데모 이미지로 실행")
+    parser.add_argument("--gpus", type=str, default=None, help="사용할 GPU (예: '0,1,2,3')")
+    parser.add_argument("--iterations", type=int, default=200, help="Perturbation 최적화 반복 횟수")
     
     args = parser.parse_args()
+    
+    # GPU 설정
+    if args.gpus:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+        print(f"[*] CUDA_VISIBLE_DEVICES 설정: {args.gpus}")
+    
+    # 메모리 최적화 환경 변수
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     
     # Hidden prompt 업데이트
     if args.hidden_prompt:
@@ -752,5 +775,5 @@ if __name__ == "__main__":
         image_path = args.image
     
     # 실험 실행
-    results = run_experiment(image_path, args.output)
+    results = run_experiment(image_path, args.output, num_iterations=args.iterations)
 
