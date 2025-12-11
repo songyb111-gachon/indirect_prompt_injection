@@ -581,15 +581,46 @@ def run_experiment(image_path, output_dir="results"):
 # 데모용 이미지 생성
 # ============================================================
 
-def create_demo_image(save_path="demo_image.png"):
-    """데모용 간단한 이미지 생성"""
+def download_sample_image(save_path="sample_image.jpg"):
+    """인터넷에서 샘플 이미지 다운로드"""
+    import urllib.request
+    
+    # 저장 디렉토리 생성
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    
+    # 무료 샘플 이미지 URL들 (Picsum - Lorem Ipsum for photos)
+    sample_urls = [
+        "https://picsum.photos/512/512",  # 랜덤 이미지
+        "https://images.unsplash.com/photo-1518717758536-85ae29035b6d?w=512",  # 강아지
+        "https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=512",  # 산
+    ]
+    
+    for url in sample_urls:
+        try:
+            print(f"[*] 샘플 이미지 다운로드 중: {url[:50]}...")
+            urllib.request.urlretrieve(url, save_path)
+            print(f"[✓] 샘플 이미지 저장: {save_path}")
+            return save_path
+        except Exception as e:
+            print(f"[!] 다운로드 실패: {e}")
+            continue
+    
+    # 모든 다운로드 실패 시 기본 이미지 생성
+    print("[*] 다운로드 실패, 기본 이미지 생성...")
+    return create_fallback_image(save_path)
+
+
+def create_fallback_image(save_path="demo_image.png"):
+    """다운로드 실패 시 기본 이미지 생성"""
     # 저장 디렉토리 생성
     save_dir = os.path.dirname(save_path)
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
     
     # 간단한 풍경 이미지 생성
-    img = Image.new('RGB', (512, 512), color=(135, 206, 235))  # 하늘색 배경
+    img = Image.new('RGB', (512, 512), color=(135, 206, 235))
     
     from PIL import ImageDraw
     draw = ImageDraw.Draw(img)
@@ -605,8 +636,13 @@ def create_demo_image(save_path="demo_image.png"):
     draw.ellipse([180, 200, 330, 320], fill=(34, 139, 34))
     
     img.save(save_path)
-    print(f"[✓] 데모 이미지 생성: {save_path}")
+    print(f"[✓] 기본 이미지 생성: {save_path}")
     return save_path
+
+
+def create_demo_image(save_path="demo_image.png"):
+    """데모용 이미지 준비 (다운로드 우선, 실패 시 생성)"""
+    return download_sample_image(save_path)
 
 # ============================================================
 # CLI
