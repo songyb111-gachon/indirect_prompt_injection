@@ -226,15 +226,7 @@ def create_adversarial_image(
     print(f"    Hidden Prompt: '{hidden_prompt}'")
     print(f"    Iterations: {num_iterations}, lr: {lr}, epsilon: {epsilon:.4f}")
     
-    # 원본 이미지를 텐서로 변환
-    original_tensor = image_to_tensor(original_image).unsqueeze(0).to(model.device)
-    original_tensor.requires_grad = False
-    
-    # Perturbation 초기화 (작은 랜덤 노이즈로 시작)
-    perturbation = torch.zeros_like(original_tensor, device=model.device, requires_grad=True)
-    
-    # Optimizer
-    optimizer = torch.optim.Adam([perturbation], lr=lr)
+    device = model.device
     
     # 프롬프트 포맷팅
     conversation = [
@@ -248,12 +240,27 @@ def create_adversarial_image(
     ]
     text_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
     
-    # 타겟 토큰 (hidden prompt의 첫 몇 토큰)
+    # 타겟 토큰 (hidden prompt를 "cat"으로 단순화)
+    target_text = "cat"
     target_tokens = processor.tokenizer(
-        hidden_prompt, 
+        target_text, 
         return_tensors="pt",
         add_special_tokens=False
-    ).input_ids.to(model.device)
+    ).input_ids.to(device)
+    
+    # 원본 이미지 처리
+    inputs = processor(
+        text=text_prompt,
+        images=original_image,
+        return_tensors="pt"
+    ).to(device)
+    
+    # pixel_values를 perturbation 대상으로
+    pixel_values = inputs["pixel_values"].clone().detach().requires_grad_(True)
+    original_pixel_values = pixel_values.clone().detach()
+    
+    # Optimizer
+    optimizer = torch.optim.Adam([pixel_values], lr=lr)
     
     losses = []
     pbar = tqdm(range(num_iterations), desc="Perturbation 최적화")
@@ -261,83 +268,91 @@ def create_adversarial_image(
     for i in pbar:
         optimizer.zero_grad()
         
-        # Perturbation 적용 (epsilon 범위 내로 클리핑)
-        delta = perturbation.clamp(-epsilon, epsilon)
-        perturbed_tensor = (original_tensor + delta).clamp(0, 1)
-        
-        # PIL Image로 변환하여 processor 통과
-        perturbed_image = tensor_to_image(perturbed_tensor.squeeze(0))
-        
-        # 입력 준비
-        inputs = processor(
-            text=text_prompt,
-            images=perturbed_image,
-            return_tensors="pt"
-        ).to(model.device)
-        
-        # pixel_values에 gradient 연결
-        # processor가 이미지를 다시 처리하므로, perturbation을 직접 연결
-        pixel_values = inputs.get("pixel_values")
-        if pixel_values is not None:
-            # pixel_values를 perturbation과 연결
-            pixel_values = pixel_values + perturbation.mean() * 0  # gradient 연결용 트릭
-            inputs["pixel_values"] = pixel_values
+        # 입력 업데이트
+        inputs["pixel_values"] = pixel_values
         
         try:
-            # Forward pass
-            outputs = model(**inputs, output_hidden_states=True, return_dict=True)
-            logits = outputs.logits
-            
-            # Loss 계산: 다음 토큰이 타겟 토큰 방향으로 가도록
-            if logits.size(1) > 0 and target_tokens.size(1) > 0:
-                next_token_logits = logits[:, -1, :]
+            # Forward pass (gradient checkpointing으로 메모리 절약)
+            with torch.amp.autocast('cuda'):
+                outputs = model(**inputs, return_dict=True)
+                logits = outputs.logits
                 
-                # 여러 타겟 토큰에 대한 loss 합산
-                loss = 0
-                for t in range(min(3, target_tokens.size(1))):
-                    target_token = target_tokens[:, t]
-                    loss += F.cross_entropy(next_token_logits, target_token)
-                loss = loss / min(3, target_tokens.size(1))
-            else:
-                loss = torch.tensor(0.0, device=model.device, requires_grad=True)
+                # Loss 계산: 다음 토큰이 "cat" 방향으로 가도록
+                if logits.size(1) > 0 and target_tokens.size(1) > 0:
+                    next_token_logits = logits[:, -1, :]
+                    target_token = target_tokens[:, 0]
+                    loss = F.cross_entropy(next_token_logits, target_token)
+                else:
+                    loss = torch.tensor(0.0, device=device, requires_grad=True)
             
             # Backward
             loss.backward()
             
             # Perturbation 업데이트 (PGD 스타일)
-            if perturbation.grad is not None:
-                # Gradient sign으로 업데이트
-                grad_sign = perturbation.grad.sign()
-                perturbation.data = perturbation.data - lr * grad_sign
+            if pixel_values.grad is not None:
+                # Gradient 방향으로 업데이트 (loss 최소화)
+                with torch.no_grad():
+                    pixel_values.data = pixel_values.data - lr * pixel_values.grad.sign()
+                    
+                    # Epsilon 범위로 projection
+                    delta = pixel_values.data - original_pixel_values
+                    delta = delta.clamp(-epsilon, epsilon)
+                    pixel_values.data = original_pixel_values + delta
+                    
+                    # [0, 1] 범위로 클리핑
+                    pixel_values.data = pixel_values.data.clamp(0, 1)
                 
-                # Epsilon 범위로 클리핑
-                perturbation.data = perturbation.data.clamp(-epsilon, epsilon)
+                pixel_values.grad.zero_()
             
             losses.append(loss.item())
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
             
+            # 메모리 정리
+            del outputs, logits
+            if i % 20 == 0:
+                torch.cuda.empty_cache()
+            
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"\n[!] CUDA OOM at iteration {i}: {e}")
+            torch.cuda.empty_cache()
+            losses.append(losses[-1] if losses else 10.0)
+            continue
         except Exception as e:
             if i == 0:
                 print(f"\n[!] Gradient 계산 에러: {e}")
             losses.append(losses[-1] if losses else 10.0)
             continue
     
-    # 최종 adversarial 이미지 생성
+    # 최종 perturbation 계산
     with torch.no_grad():
-        final_delta = perturbation.clamp(-epsilon, epsilon)
-        final_tensor = (original_tensor + final_delta).clamp(0, 1)
-        adversarial_image = tensor_to_image(final_tensor.squeeze(0))
-    
-    # Perturbation 시각화용
-    perturbation_vis = perturbation.squeeze(0).detach().cpu()
-    
-    # 통계 출력
-    pert_np = perturbation.detach().cpu().numpy()
-    print(f"\n[✓] Perturbation 완료!")
-    print(f"    최종 Loss: {losses[-1]:.4f}")
-    print(f"    Perturbation L∞: {np.abs(pert_np).max():.6f}")
-    print(f"    Perturbation L2: {np.sqrt((pert_np**2).sum()):.4f}")
-    print(f"    픽셀 변화 (0-255): max={np.abs(pert_np).max()*255:.2f}, mean={np.abs(pert_np).mean()*255:.4f}")
+        final_delta = pixel_values - original_pixel_values
+        
+        # 통계
+        pert_np = final_delta.cpu().numpy()
+        print(f"\n[✓] Perturbation 완료!")
+        print(f"    최종 Loss: {losses[-1]:.4f}")
+        print(f"    Perturbation L∞: {np.abs(pert_np).max():.6f}")
+        print(f"    Perturbation L2: {np.sqrt((pert_np**2).sum()):.4f}")
+        print(f"    픽셀 변화 (0-255): max={np.abs(pert_np).max()*255:.2f}, mean={np.abs(pert_np).mean()*255:.4f}")
+        
+        # Adversarial 이미지 생성 (processor의 역변환)
+        # pixel_values는 정규화되어 있으므로 역정규화 필요
+        adv_pixel = pixel_values.squeeze(0).cpu()
+        
+        # LLaVA processor의 정규화: mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
+        # 역변환: x * 0.5 + 0.5
+        adv_pixel = adv_pixel * 0.5 + 0.5
+        adv_pixel = adv_pixel.clamp(0, 1)
+        
+        # CHW -> HWC
+        adv_array = (adv_pixel.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        adversarial_image = Image.fromarray(adv_array)
+        
+        # 원본 이미지 크기로 리사이즈 (processor가 336x336으로 변환했을 수 있음)
+        adversarial_image = adversarial_image.resize(original_image.size, Image.LANCZOS)
+        
+        # Perturbation 시각화용
+        perturbation_vis = final_delta.squeeze(0).cpu()
     
     return adversarial_image, perturbation_vis, losses
 
@@ -500,8 +515,8 @@ def run_experiment(image_path, output_dir="results"):
     print("Indirect Prompt Injection (From Image) 실습")
     print("=" * 60)
     
-    # 1. 모델 로드
-    model, processor = load_model()
+    # 1. 모델 로드 (처음부터 float16으로 - gradient 계산 가능)
+    model, processor = load_model(for_attack=True)  # 양자화 없이 로드
     
     # 2. 이미지 로드
     print(f"\n[*] 이미지 로드: {image_path}")
@@ -540,12 +555,11 @@ def run_experiment(image_path, output_dir="results"):
     print(f"\n{'='*60}")
     print("[이미지 Perturbation 공격 - Gradient 기반]")
     print(f"{'='*60}")
-    print("[*] Perturbation 공격을 위해 모델 재로드 (gradient 계산용)...")
     
-    # Gradient 계산을 위해 양자화 없이 모델 재로드
-    del model
+    # 메모리 정리
     torch.cuda.empty_cache()
-    model, processor = load_model(for_attack=True)
+    import gc
+    gc.collect()
     
     adv_response = ""
     try:
